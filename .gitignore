@@ -1,0 +1,18 @@
+# VSCode
+.vscode/
+*.code-workspace
+
+# Compiled files
+*.o
+*.so
+*.a
+*.out
+*.exe
+pingmac
+
+# Build directories
+build/
+bin/
+
+# System files
+.DS_Store
