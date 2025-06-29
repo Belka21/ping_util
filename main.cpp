@@ -12,7 +12,9 @@
 
 #include <algorithm>
 #include <cstring>
+#include <fstream>
 #include <iostream>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -25,29 +27,34 @@ struct icmp_packet {
   char payload[64];
 };
 
+// Структура для хранения данных callback
+struct CallbackData {
+  ether_addr target_mac;
+  bool reply_received;
+};
+
 // Функция вычисления контрольной суммы ICMP (RFC 1071)
 unsigned short checksum(void* buffer, size_t length) {
   unsigned int sum = 0;
 
   if (buffer != nullptr && length != 0) {
     unsigned char* buf = (unsigned char*)buffer;
-    // Обработка основной части данных (по 2 байта)
+
     while (length > 1) {
       unsigned short word;
-      memcpy(&word, buf,
-             sizeof(word));  // Безопасное копирование с любым выравниванием
+      memcpy(&word, buf, sizeof(word));
       sum += word;
       buf += 2;
       length -= 2;
     }
 
-    // Обработка оставшегося байта, если длина нечётная
+    // если длина нечётная
     if (length == 1) {
-      unsigned short word = *buf;  // Оставшийся байт дополняется нулём
+      unsigned short word = *buf;
       sum += word;
     }
 
-    // Свёртывание 32-битной суммы в 16 бит
+    // cвёртывание 32-битной суммы в 16 бит
     sum = (sum >> 16) + (sum & 0xFFFF);
     sum += (sum >> 16);
   }
@@ -56,9 +63,10 @@ unsigned short checksum(void* buffer, size_t length) {
 }
 
 // Проверка существования интерфейса
-bool is_interface_exists(const string& interface) {
+bool is_interface_exists(const std::string& interface) {
   int fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0) {
+    std::cerr << "socket() failed: " << strerror(errno) << std::endl;
     return false;
   }
 
@@ -66,28 +74,72 @@ bool is_interface_exists(const string& interface) {
   memset(&ifr, 0, sizeof(ifr));
   strncpy(ifr.ifr_name, interface.c_str(), IFNAMSIZ - 1);
 
-  bool exists = (ioctl(fd, SIOCGIFINDEX, &ifr) >= 0);
+  // Попробуем получить флаги интерфейса
+  int result = ioctl(fd, SIOCGIFFLAGS, &ifr);
+  if (result < 0) {
+    std::cerr << "ioctl(SIOCGIFFLAGS) failed for interface '"
+              << interface << "': " << strerror(errno) << " (" << errno << ")"
+              << std::endl;
+  } else {
+    std::cout << "Interface '" << interface << "' exists with flags: 0x"
+              << std::hex << ifr.ifr_flags << std::dec << std::endl;
+  }
+
   close(fd);
-  return exists;
+  return (result >= 0);
 }
 
+// Callback-функция для обработки пакетов
+void packet_handler(u_char* user_data, const struct pcap_pkthdr* header,
+                    const u_char* packet) {
+  if (!user_data) {
+    cerr << "Error: user_data is nullptr (callback context missing)" << endl;
+    return;
+  }
+
+  if (!header) {
+    cerr << "Error: pcap_pkthdr is nullptr" << endl;
+    return;
+  }
+
+  if (!packet) {
+    cerr << "Error: packet data is nullptr" << endl;
+    return;
+  }
+
+  CallbackData* data = reinterpret_cast<CallbackData*>(user_data);
+
+  if (header->len < sizeof(struct ether_header) + sizeof(struct iphdr)) {
+    cerr << "Packet too small to be IPv4" << endl;
+    return;
+  }
+
+  // Извлекаем MAC-адрес из Ethernet-заголовка
+  struct ether_header* eth_header = (struct ether_header*)packet;
+  memcpy(&data->target_mac, eth_header->ether_shost, sizeof(data->target_mac));
+  data->reply_received = true;
+}
+
+// Запрос маршрута по умолчанию
 string get_default_interface() {
-  int fd = socket(AF_INET, SOCK_DGRAM, 0);
-  if (fd < 0) {
-    throw runtime_error("Failed to create socket");
+  ifstream route_file("/proc/net/route");
+  string line;
+
+  getline(route_file, line);
+
+  while (getline(route_file, line)) {
+    istringstream iss(line);
+    string iface;
+    unsigned long dest;
+
+    iss >> iface >> hex >> dest;
+
+    if (dest == 0) {
+      return iface;
+    }
   }
 
-  struct rtentry rt;
-  memset(&rt, 0, sizeof(rt));
-
-  // Запрашиваем маршрут по умолчанию
-  if (ioctl(fd, SIOCGRTCONF, &rt) < 0) {
-    close(fd);
-    throw runtime_error("Failed to get default route");
-  }
-
-  close(fd);
-  return string(rt.rt_dev);
+  throw runtime_error("Default route not found");
 }
 
 // Отправка ICMP Echo Request
@@ -99,11 +151,9 @@ void send_icmp_echo(int sockfd, const string& target_ip) {
     throw runtime_error("Invalid target IP address");
   }
 
-  // Создаем ICMP пакет
   icmp_packet packet;
   memset(&packet, 0, sizeof(packet));
 
-  // Заполняем заголовок ICMP
   packet.header.type = ICMP_ECHO;
   packet.header.code = 0;
   packet.header.un.echo.id = htons((uint16_t)getpid());
@@ -111,10 +161,8 @@ void send_icmp_echo(int sockfd, const string& target_ip) {
   memset(packet.payload, 'A', sizeof(packet.payload));
   packet.payload[sizeof(packet.payload) - 1] = '\0';
 
-  // Вычисляем контрольную сумму
   packet.header.checksum = checksum(&packet, sizeof(packet));
 
-  // Отправляем пакет
   if (sendto(sockfd, &packet, sizeof(packet), 0, (struct sockaddr*)&dest_addr,
              sizeof(dest_addr)) <= 0) {
     throw runtime_error("Failed to send ICMP packet");
@@ -122,27 +170,19 @@ void send_icmp_echo(int sockfd, const string& target_ip) {
 }
 
 // Получение MAC адреса из ответа
-void get_mac_address(const string& interface, const string& target_ip,
-                     uint16_t expected_id, uint16_t expected_seq) {
+void get_mac_address(const string& interface, const string& target_ip) {
   if (!is_interface_exists(interface)) {
     throw runtime_error("Network interface '" + interface + "' does not exist");
   }
 
   char errbuf[PCAP_ERRBUF_SIZE];
-  pcap_t* handle = pcap_open_live(interface.c_str(), BUFSIZ, 1, 1000, errbuf);
+  pcap_t* handle = pcap_open_live(interface.c_str(), BUFSIZ, 1, 4000, errbuf);
   if (!handle) {
     throw runtime_error("Could not open device: " + string(errbuf));
   }
 
-  // Формируем BPF-фильтр с проверкой id и sequence
-  char id_str[10], seq_str[10];
-  snprintf(id_str, sizeof(id_str), "0x%x", ntohs(expected_id));
-  snprintf(seq_str, sizeof(seq_str), "0x%x", ntohs(expected_seq));
-
-  string filter = "icmp and src host " + target_ip +
-                  " and icmp[0] == 0" +  // ICMP Echo Reply
-                  " and icmp[4:2] == " + id_str +
-                  " and icmp[6:2] == " + seq_str;
+  // BPF-фильтр
+  string filter = "icmp and src host " + target_ip + " and icmp[0] == 0";
 
   struct bpf_program fp;
   if (pcap_compile(handle, &fp, filter.c_str(), 0, PCAP_NETMASK_UNKNOWN) ==
@@ -153,36 +193,35 @@ void get_mac_address(const string& interface, const string& target_ip,
   }
 
   if (pcap_setfilter(handle, &fp) == -1) {
-    pcap_freecode(&fp);
     pcap_close(handle);
     throw runtime_error("Could not install filter: " +
                         string(pcap_geterr(handle)));
   }
 
   // Ожидаем ответ (с таймаутом)
-  struct pcap_pkthdr header;
-  const u_char* packet = pcap_next(handle, &header);
-  pcap_freecode(&fp);
+  CallbackData data = {};
+  data.reply_received = false;
 
-  if (!packet) {
-    pcap_close(handle);
+  pcap_setnonblock(handle, 1, errbuf);
+  time_t start = time(nullptr);
+  while (time(nullptr) - start < 10) {
+    int ret = pcap_dispatch(handle, 1, packet_handler,
+                            reinterpret_cast<u_char*>(&data));
+    if (ret > 0) break;  // получили пакет
+    if (ret == -1) {
+    }  // пакета нет
+  }
+  pcap_close(handle);
+
+  if (!data.reply_received) {
     throw runtime_error("No ICMP reply received (timeout or filter mismatch)");
   }
 
-  // Проверяем, что пакет достаточно большой
-  if (header.len < sizeof(struct ether_header) + sizeof(struct iphdr)) {
-    pcap_close(handle);
-    throw runtime_error("Packet too small to be IPv4");
-  }
-
-  // Извлекаем MAC-адрес из Ethernet-заголовка
-  struct ether_header* eth_header = (struct ether_header*)packet;
-  printf("Target MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
-         eth_header->ether_dhost[0], eth_header->ether_dhost[1],
-         eth_header->ether_dhost[2], eth_header->ether_dhost[3],
-         eth_header->ether_dhost[4], eth_header->ether_dhost[5]);
-
-  pcap_close(handle);
+  printf(
+      "Target MAC: %02x:%02x:%02x:%02x:%02x:%02x\n",
+      data.target_mac.ether_addr_octet[0], data.target_mac.ether_addr_octet[1],
+      data.target_mac.ether_addr_octet[2], data.target_mac.ether_addr_octet[3],
+      data.target_mac.ether_addr_octet[4], data.target_mac.ether_addr_octet[5]);
 }
 
 int main(int argc, char* argv[]) {
@@ -224,9 +263,7 @@ int main(int argc, char* argv[]) {
     }
 
     send_icmp_echo(sockfd, target_ip);
-    uint16_t id = htons((uint16_t)getpid());
-    uint16_t seq = htons(1);
-    get_mac_address(interface, target_ip, id, seq);
+    get_mac_address(interface, target_ip);
 
     close(sockfd);
   }
